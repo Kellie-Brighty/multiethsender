@@ -30,7 +30,7 @@ import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { BrowserProvider, parseEther, type Signer } from 'ethers';
 import { generateWallets, exportToCSV, exportToJSON, type GeneratedWallet } from './utils';
-import { sendEqualAmounts, prepareRecipientsFromWallets, calculateTotalAmount } from './contractUtils';
+import { sendEqualAmounts, sendDifferentAmounts, prepareRecipientsFromWallets, calculateTotalAmount } from './contractUtils';
 import { EXPECTED_CHAIN_ID } from './contract';
 import { 
   getWalletHistory, 
@@ -40,6 +40,7 @@ import {
   getSessionStats,
   exportSessionToCSV,
   exportSessionToJSON,
+  formatRelativeTime,
   type WalletSession 
 } from './historyUtils';
 
@@ -111,6 +112,13 @@ export default function App() {
   useEffect(() => {
     const walletHistory = getWalletHistory();
     setHistory(walletHistory.sessions);
+  }, []);
+
+  // Update relative time labels every minute
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick(prev => prev + 1), 60000);
+    return () => clearInterval(timer);
   }, []);
 
   // Persistence logic
@@ -198,7 +206,7 @@ export default function App() {
 
   const handleGenerate = () => {
     const num = typeof count === 'string' ? parseInt(count) || 1 : count;
-    const newWallets = generateWallets(num);
+    const newWallets = generateWallets(num, fundingAmount);
     
     // Create new session in history FIRST
     const newSession = addSessionToHistory({
@@ -242,7 +250,7 @@ export default function App() {
 
         const tx = await signer.sendTransaction({
           to: wallet.address,
-          value: parseEther(fundingAmount),
+          value: parseEther(wallet.amount),
         });
 
         updatedWallets[i] = { ...updatedWallets[i], status: 'pending', txHash: tx.hash };
@@ -285,9 +293,19 @@ export default function App() {
 
     try {
       const recipients = prepareRecipientsFromWallets(wallets);
-      const totalAmount = calculateTotalAmount(fundingAmount, wallets.length);
+      
+      // Check if all amounts are the same
+      const firstAmount = wallets[0].amount;
+      const allSame = wallets.every(w => w.amount === firstAmount);
 
-      const result = await sendEqualAmounts(signer, recipients, totalAmount);
+      let result;
+      if (allSame) {
+        const totalAmount = calculateTotalAmount(firstAmount, wallets.length);
+        result = await sendEqualAmounts(signer, recipients, totalAmount);
+      } else {
+        const amounts = wallets.map(w => w.amount);
+        result = await sendDifferentAmounts(signer, recipients, amounts);
+      }
 
       if (result.success && result.txHash) {
         setBulkTxHash(result.txHash);
@@ -323,6 +341,12 @@ export default function App() {
     
     // Refresh balance after bulk transfer
     await refreshBalance();
+  };
+
+  const updateWalletAmount = (index: number, newAmount: string) => {
+    setWallets(prev => prev.map(w => 
+      w.index === index ? { ...w, amount: newAmount } : w
+    ));
   };
 
   const togglePrivateKey = (index: number) => {
@@ -554,13 +578,13 @@ export default function App() {
               </div>
             </div>
 
-            <div className="col-span-1 sm:col-span-2 lg:col-span-1 grid grid-cols-2 lg:flex gap-3">
+            <div className="col-span-1 sm:col-span-2 lg:flex-1 flex flex-wrap items-end gap-3">
               <button 
                 onClick={handleGenerate}
-                className="col-span-2 lg:col-span-1 px-6 py-3 sm:py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-semibold transition-all shadow-lg shadow-blue-600/20 flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95"
+                className="flex-2 min-w-[140px] px-6 py-3 sm:py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-semibold transition-all shadow-lg shadow-blue-600/20 flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95"
               >
-                <Plus size={20} className="group-hover:rotate-90 transition-transform duration-300 text-white" />
-                <span className="text-white">Generate</span>
+                <Plus size={20} className="group-hover:rotate-90 transition-transform duration-300" />
+                <span>Generate</span>
               </button>
 
               {transferMode === 'individual' ? (
@@ -568,7 +592,7 @@ export default function App() {
                   onClick={fundAllWallets}
                   disabled={wallets.length === 0 || isFunding || !signer}
                   className={cn(
-                    "col-span-1 lg:col-span-1 px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
+                    "flex-2 min-w-[140px] px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
                     signer 
                       ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20 disabled:opacity-50" 
                       : "bg-white/5 border border-white/10 text-white/20 cursor-not-allowed"
@@ -577,7 +601,7 @@ export default function App() {
                   {isFunding ? (
                     <Loader2 size={20} className="animate-spin" />
                   ) : (
-                    <Coins size={20} className="" />
+                    <Coins size={20} />
                   )}
                   <span>{isFunding ? 'Funding' : 'Fund All'}</span>
                 </button>
@@ -586,7 +610,7 @@ export default function App() {
                   onClick={handleBulkTransfer}
                   disabled={wallets.length === 0 || isBulkTransferring || !signer || chainId !== EXPECTED_CHAIN_ID}
                   className={cn(
-                    "col-span-1 lg:col-span-1 px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
+                    "flex-2 min-w-[140px] px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
                     signer && chainId === EXPECTED_CHAIN_ID
                       ? "bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-600/20 disabled:opacity-50" 
                       : "bg-white/5 border border-white/10 text-white/20 cursor-not-allowed"
@@ -602,11 +626,11 @@ export default function App() {
               )}
 
               {wallets.length > 0 && (
-                <div className="col-span-1 lg:col-span-1 flex gap-2">
+                <div className="flex gap-2">
                   <Tooltip text="Export CSV">
                     <button 
                       onClick={() => exportToCSV(wallets)}
-                      className="flex-1 p-3 sm:p-4 bg-white/8 hover:bg-white/15 border border-white/10 rounded-xl transition-all flex items-center justify-center"
+                      className="p-3 sm:p-4 bg-white/8 hover:bg-white/15 border border-white/10 rounded-xl transition-all flex items-center justify-center shrink-0"
                     >
                       <FileSpreadsheet size={20} className="text-emerald-400" />
                     </button>
@@ -614,7 +638,7 @@ export default function App() {
                   <Tooltip text="Export JSON">
                     <button 
                       onClick={() => exportToJSON(wallets)}
-                      className="flex-1 p-3 sm:p-4 bg-white/8 hover:bg-white/15 border border-white/10 rounded-xl transition-all flex items-center justify-center"
+                      className="p-3 sm:p-4 bg-white/8 hover:bg-white/15 border border-white/10 rounded-xl transition-all flex items-center justify-center shrink-0"
                     >
                       <FileJson size={20} className="text-orange-400" />
                     </button>
@@ -622,13 +646,12 @@ export default function App() {
                   <Tooltip text="Clear All">
                     <button 
                       onClick={() => { 
-                        // Current session is already in history, just clear UI
                         setWallets([]); 
                         setCurrentPage(1); 
                         setBulkTxHash(null); 
                         setCurrentSessionId(null);
                       }}
-                      className="flex-1 p-3 sm:p-4 bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 rounded-xl transition-all flex items-center justify-center"
+                      className="p-3 sm:p-4 bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 rounded-xl transition-all flex items-center justify-center shrink-0"
                     >
                       <Trash2 size={20} className="text-red-400" />
                     </button>
@@ -709,46 +732,60 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:flex lg:flex-1 gap-4 lg:gap-6">
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:flex lg:flex-1 gap-4 lg:gap-4 items-end">
                     {/* Public Address */}
-                    <div className="space-y-1.5 overflow-hidden lg:flex-1">
+                    <div className="space-y-1.5 min-w-0 lg:flex-3">
                       <label className="text-[10px] uppercase tracking-wider text-white/30 font-semibold ml-0.5">Address</label>
-                      <div className="flex items-center gap-3 bg-white/3 rounded-lg p-3 group/item">
-                        <code className="flex-1 font-mono text-[11px] sm:text-sm text-white/70 overflow-hidden text-ellipsis whitespace-nowrap">
+                      <div className="flex items-center gap-2 bg-white/3 rounded-lg p-2.5 group/item">
+                        <code className="flex-1 font-mono text-[11px] sm:text-sm text-white/70 truncate">
                           {wallet.address}
                         </code>
                         <Tooltip text={copiedIndex?.index === wallet.index && copiedIndex?.type === 'address' ? "Copied!" : "Copy Address"}>
                           <button 
                             onClick={() => copyToClipboard(wallet.address, wallet.index, 'address')}
-                            className="p-1.5 bg-white/5 hover:bg-white/15 rounded-md transition-colors text-white/40 hover:text-white"
+                            className="p-1.5 bg-white/5 hover:bg-white/15 rounded-md transition-colors text-white/40 hover:text-white shrink-0"
                           >
                             {copiedIndex?.index === wallet.index && copiedIndex?.type === 'address' ? (
-                              <CheckCircle2 size={16} className="text-emerald-400" />
+                              <CheckCircle2 size={14} className="text-emerald-400" />
                             ) : (
-                              <Copy size={16} className="text-white/60" />
+                              <Copy size={14} className="text-white/60" />
                             )}
                           </button>
                         </Tooltip>
                       </div>
                     </div>
 
+                    {/* Amount */}
+                    <div className="space-y-1.5 lg:w-[100px] shrink-0">
+                      <label className="text-[10px] uppercase tracking-wider text-white/30 font-semibold ml-0.5">Amount</label>
+                      <div className="flex items-center gap-1 bg-white/3 rounded-lg p-2.5 border border-white/5 focus-within:border-emerald-500/30 transition-colors">
+                        <input 
+                          type="text"
+                          value={wallet.amount}
+                          onChange={(e) => updateWalletAmount(wallet.index, e.target.value)}
+                          className="w-full bg-transparent border-none focus:outline-none text-[12px] sm:text-sm font-mono text-emerald-400 text-center"
+                          placeholder="0.01"
+                        />
+                      </div>
+                    </div>
+
                     {/* Private Key */}
-                    <div className="space-y-1.5 overflow-hidden lg:flex-1">
+                    <div className="space-y-1.5 min-w-0 lg:flex-2">
                       <label className="text-[10px] uppercase tracking-wider text-white/30 font-semibold ml-0.5">Private Key</label>
-                      <div className="flex items-center gap-3 bg-white/3 rounded-lg p-3 group/item">
+                      <div className="flex items-center gap-2 bg-white/3 rounded-lg p-2.5 group/item">
                         <code className={cn(
-                          "flex-1 font-mono text-[11px] sm:text-sm transition-all duration-300 overflow-hidden text-ellipsis whitespace-nowrap",
+                          "flex-1 font-mono text-[11px] sm:text-sm transition-all duration-300 truncate",
                           showPrivateKeys[wallet.index] ? "text-red-400/80" : "text-white/20 blur-sm select-none"
                         )}>
                           {wallet.privateKey}
                         </code>
-                        <div className="flex items-center gap-1">
+                        <div className="flex items-center gap-1 shrink-0">
                           <Tooltip text={showPrivateKeys[wallet.index] ? "Hide" : "Show"}>
                             <button 
                               onClick={() => togglePrivateKey(wallet.index)}
                               className="p-1.5 bg-white/5 hover:bg-white/15 rounded-md transition-colors text-white/40 hover:text-white"
                             >
-                              {showPrivateKeys[wallet.index] ? <EyeOff size={16} className="text-white/60" /> : <Eye size={16} className="text-white/60" />}
+                              {showPrivateKeys[wallet.index] ? <EyeOff size={14} className="text-white/60" /> : <Eye size={14} className="text-white/60" />}
                             </button>
                           </Tooltip>
                           <Tooltip text={copiedIndex?.index === wallet.index && copiedIndex?.type === 'pk' ? "Copied!" : "Copy PK"}>
@@ -757,9 +794,9 @@ export default function App() {
                               className="p-1.5 bg-white/5 hover:bg-white/15 rounded-md transition-colors text-white/40 hover:text-white"
                             >
                               {copiedIndex?.index === wallet.index && copiedIndex?.type === 'pk' ? (
-                                <CheckCircle2 size={16} className="text-emerald-400" />
+                                <CheckCircle2 size={14} className="text-emerald-400" />
                               ) : (
-                                <Copy size={16} className="text-white/60" />
+                                <Copy size={14} className="text-white/60" />
                               )}
                             </button>
                           </Tooltip>
@@ -769,7 +806,7 @@ export default function App() {
                   </div>
 
                   {/* Desktop Status & Actions */}
-                  <div className="hidden lg:flex items-center gap-4 lg:min-w-[120px] justify-end">
+                  <div className="hidden lg:flex items-center gap-3 lg:min-w-[110px] justify-end pt-5">
                     {wallet.status === 'idle' && (
                       <div className="text-[10px] font-bold text-white/20 uppercase tracking-widest px-3 py-1 bg-white/5 rounded-full border border-white/5">
                         Ready
@@ -955,7 +992,10 @@ export default function App() {
                           <div className="flex-1">
                             <div className="flex items-center gap-2 mb-2">
                               <span className="text-sm font-semibold text-white/80">
-                                {date.toLocaleDateString()} {date.toLocaleTimeString()}
+                                {formatRelativeTime(session.timestamp)}
+                              </span>
+                              <span className="text-[10px] text-white/30 font-medium">
+                                ({date.toLocaleDateString()} {date.toLocaleTimeString()})
                               </span>
                               {session.transferMode === 'bulk' && (
                                 <span className="px-2 py-0.5 bg-purple-500/20 text-purple-400 rounded text-xs font-semibold flex items-center gap-1">

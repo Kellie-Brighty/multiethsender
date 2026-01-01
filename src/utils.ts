@@ -7,11 +7,12 @@ export interface GeneratedWallet {
   address: string;
   privateKey: string;
   status: TransactionStatus;
+  amount: string;
   txHash?: string;
   error?: string;
 }
 
-export const generateWallets = (count: number): GeneratedWallet[] => {
+export const generateWallets = (count: number, defaultAmount: string = "0.01"): GeneratedWallet[] => {
   const wallets: GeneratedWallet[] = [];
   for (let i = 0; i < count; i++) {
     const wallet = Wallet.createRandom();
@@ -20,6 +21,7 @@ export const generateWallets = (count: number): GeneratedWallet[] => {
       address: wallet.address,
       privateKey: wallet.privateKey,
       status: 'idle',
+      amount: defaultAmount,
     });
   }
   return wallets;
