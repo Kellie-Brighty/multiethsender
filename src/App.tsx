@@ -4,7 +4,6 @@ import {
   Plus, 
   Trash2, 
   Copy, 
-  ShieldCheck, 
   Wallet as WalletIcon, 
   CheckCircle2,
   FileJson,
@@ -408,22 +407,22 @@ export default function App() {
         {/* Header Section */}
         <div className="flex flex-col sm:flex-row justify-between items-center gap-6">
           <div className="text-center sm:text-left space-y-4">
-            <motion.div 
-              initial={{ opacity: 0, y: -20 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-400 text-xs sm:text-sm font-medium"
-            >
-              <ShieldCheck size={16} />
-              Secure Client-Side Generation
-            </motion.div>
             <motion.h1 
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: 0.1 }}
-              className="text-3xl sm:text-4xl md:text-5xl font-bold tracking-tight bg-linear-to-b from-white to-white/60 bg-clip-text text-transparent"
+              className="text-4xl sm:text-5xl md:text-6xl font-bold tracking-tighter bg-linear-to-b from-white to-white/60 bg-clip-text text-transparent"
             >
-              Ethereum Wallet Generator
+              Ethos
             </motion.h1>
+            <motion.p
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ delay: 0.2 }}
+              className="text-sm sm:text-base text-white/40 font-medium max-w-md leading-relaxed"
+            >
+              Generate, fund, and manage multiple Ethereum wallets in one seamless rhythm.
+            </motion.p>
             {wallets.length > 0 && (
               <motion.div 
                 initial={{ opacity: 0 }}
@@ -1154,7 +1153,7 @@ export default function App() {
         )}
 
         <footer className="text-center pt-8 text-white/20 text-xs">
-          <p>© 2025 Ethereum Wallet Generator • Built with Privacy in Mind</p>
+          <p>© 2026 Ethos • Orchestrated by Kellie-Brighty</p>
         </footer>
       </main>
     </div>
