@@ -17,12 +17,31 @@ import {
   AlertCircle,
   Save,
   EyeOff,
-  Eye
+  Eye,
+  Zap,
+  Network,
+  History,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  RotateCcw
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { BrowserProvider, parseEther, type Signer } from 'ethers';
 import { generateWallets, exportToCSV, exportToJSON, type GeneratedWallet } from './utils';
+import { sendEqualAmounts, prepareRecipientsFromWallets, calculateTotalAmount } from './contractUtils';
+import { EXPECTED_CHAIN_ID } from './contract';
+import { 
+  getWalletHistory, 
+  addSessionToHistory, 
+  updateSessionInHistory, 
+  deleteSessionFromHistory,
+  getSessionStats,
+  exportSessionToCSV,
+  exportSessionToJSON,
+  type WalletSession 
+} from './historyUtils';
 
 declare global {
   interface Window {
@@ -74,6 +93,25 @@ export default function App() {
   const [userAddress, setUserAddress] = useState<string | null>(null);
   const [fundingAmount, setFundingAmount] = useState<string>("0.01");
   const [isFunding, setIsFunding] = useState(false);
+  
+  // Smart Contract Bulk Transfer State
+  const [transferMode, setTransferMode] = useState<'individual' | 'bulk'>('individual');
+  const [isBulkTransferring, setIsBulkTransferring] = useState(false);
+  const [bulkTxHash, setBulkTxHash] = useState<string | null>(null);
+  const [chainId, setChainId] = useState<number | null>(null);
+  
+  // History State
+  const [history, setHistory] = useState<WalletSession[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
+  const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set());
+  const [walletBalance, setWalletBalance] = useState<string | null>(null);
+
+  // Load history on mount
+  useEffect(() => {
+    const walletHistory = getWalletHistory();
+    setHistory(walletHistory.sessions);
+  }, []);
 
   // Persistence logic
   useEffect(() => {
@@ -90,10 +128,27 @@ export default function App() {
   useEffect(() => {
     if (wallets.length > 0) {
       localStorage.setItem('eth_wallets_session', JSON.stringify(wallets));
+      
+      // Update current session in history if it exists
+      if (currentSessionId) {
+        const stats = {
+          successfulTransfers: wallets.filter(w => w.status === 'success').length,
+          failedTransfers: wallets.filter(w => w.status === 'error').length,
+        };
+        updateSessionInHistory(currentSessionId, {
+          wallets,
+          bulkTxHash: bulkTxHash || undefined,
+          ...stats,
+        });
+        
+        // Refresh history state
+        const updatedHistory = getWalletHistory();
+        setHistory(updatedHistory.sessions);
+      }
     } else {
       localStorage.removeItem('eth_wallets_session');
     }
-  }, [wallets]);
+  }, [wallets, bulkTxHash, currentSessionId]);
 
   const connectWallet = async () => {
     if (window.ethereum) {
@@ -101,7 +156,17 @@ export default function App() {
         const provider = new BrowserProvider(window.ethereum);
         const newSigner = await provider.getSigner();
         setSigner(newSigner);
-        setUserAddress(await newSigner.getAddress());
+        const address = await newSigner.getAddress();
+        setUserAddress(address);
+        
+        // Detect network
+        const network = await provider.getNetwork();
+        setChainId(Number(network.chainId));
+        
+        // Fetch balance
+        const balance = await provider.getBalance(address);
+        const balanceInEth = (Number(balance) / 1e18).toFixed(4);
+        setWalletBalance(balanceInEth);
       } catch (err) {
         console.error("User rejected the connection", err);
       }
@@ -113,14 +178,52 @@ export default function App() {
   const disconnectWallet = () => {
     setSigner(null);
     setUserAddress(null);
+    setChainId(null);
+    setBulkTxHash(null);
+    setWalletBalance(null);
+  };
+
+  const refreshBalance = async () => {
+    if (signer && userAddress) {
+      try {
+        const provider = new BrowserProvider(window.ethereum!);
+        const balance = await provider.getBalance(userAddress);
+        const balanceInEth = (Number(balance) / 1e18).toFixed(4);
+        setWalletBalance(balanceInEth);
+      } catch (error) {
+        console.error('Failed to refresh balance:', error);
+      }
+    }
   };
 
   const handleGenerate = () => {
     const num = typeof count === 'string' ? parseInt(count) || 1 : count;
     const newWallets = generateWallets(num);
+    
+    // Create new session in history FIRST
+    const newSession = addSessionToHistory({
+      wallets: newWallets,
+      transferMode,
+      fundingAmount,
+      totalWallets: num,
+      successfulTransfers: 0,
+      failedTransfers: 0,
+    });
+    
+    setCurrentSessionId(newSession.id);
+    
+    // Then set wallets
     setWallets(newWallets);
     setShowPrivateKeys({});
     setCurrentPage(1);
+    setBulkTxHash(null);
+    
+    // Refresh history
+    const updatedHistory = getWalletHistory();
+    setHistory(updatedHistory.sessions);
+    
+    console.log('Session created:', newSession.id);
+    console.log('History updated:', updatedHistory.sessions.length);
   };
 
   const fundAllWallets = async () => {
@@ -156,14 +259,70 @@ export default function App() {
         const errorMessage = 
           error?.info?.error?.message || 
           error?.reason || 
-          error?.message || 
-          "Unknown error";
-          
+          error?.message ||
+          'Transaction failed';
         updatedWallets[i] = { ...updatedWallets[i], status: 'error', error: errorMessage };
         setWallets([...updatedWallets]);
       }
     }
     setIsFunding(false);
+    
+    // Refresh balance after funding
+    await refreshBalance();
+  };
+
+  const handleBulkTransfer = async () => {
+    if (!signer) return;
+    
+    // Check if on correct network
+    if (chainId !== EXPECTED_CHAIN_ID) {
+      alert(`Please switch to Ethereum Mainnet (Chain ID: ${EXPECTED_CHAIN_ID})`);
+      return;
+    }
+
+    setIsBulkTransferring(true);
+    setBulkTxHash(null);
+
+    try {
+      const recipients = prepareRecipientsFromWallets(wallets);
+      const totalAmount = calculateTotalAmount(fundingAmount, wallets.length);
+
+      const result = await sendEqualAmounts(signer, recipients, totalAmount);
+
+      if (result.success && result.txHash) {
+        setBulkTxHash(result.txHash);
+        
+        // Mark all wallets as pending
+        const updatedWallets = wallets.map(w => ({ ...w, status: 'pending' as const, txHash: result.txHash }));
+        setWallets(updatedWallets);
+
+        // Wait for transaction confirmation
+        const provider = new BrowserProvider(window.ethereum!);
+        const tx = await provider.getTransaction(result.txHash);
+        if (tx) {
+          await tx.wait();
+          
+          // Mark all as success
+          const successWallets = wallets.map(w => ({ ...w, status: 'success' as const, txHash: result.txHash }));
+          setWallets(successWallets);
+        }
+      } else {
+        alert(`Bulk transfer failed: ${result.error}`);
+        // Mark all as error
+        const errorWallets = wallets.map(w => ({ ...w, status: 'error' as const, error: result.error }));
+        setWallets(errorWallets);
+      }
+    } catch (error: any) {
+      console.error('Bulk transfer error:', error);
+      alert(`Bulk transfer failed: ${error.message}`);
+      const errorWallets = wallets.map(w => ({ ...w, status: 'error' as const, error: error.message }));
+      setWallets(errorWallets);
+    }
+
+    setIsBulkTransferring(false);
+    
+    // Refresh balance after bulk transfer
+    await refreshBalance();
   };
 
   const togglePrivateKey = (index: number) => {
@@ -174,6 +333,37 @@ export default function App() {
     await navigator.clipboard.writeText(text);
     setCopiedIndex({ index, type });
     setTimeout(() => setCopiedIndex(null), 2000);
+  };
+
+  const toggleSessionExpand = (sessionId: string) => {
+    setExpandedSessions(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(sessionId)) {
+        newSet.delete(sessionId);
+      } else {
+        newSet.add(sessionId);
+      }
+      return newSet;
+    });
+  };
+
+  const restoreSession = (session: WalletSession) => {
+    setWallets(session.wallets);
+    setFundingAmount(session.fundingAmount);
+    setTransferMode(session.transferMode);
+    setBulkTxHash(session.bulkTxHash || null);
+    setCurrentSessionId(session.id);
+    setCurrentPage(1);
+    setShowHistory(false);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleDeleteSession = (sessionId: string) => {
+    if (confirm('Are you sure you want to permanently delete this session? This action cannot be undone.')) {
+      deleteSessionFromHistory(sessionId);
+      const updatedHistory = getWalletHistory();
+      setHistory(updatedHistory.sessions);
+    }
   };
 
   const totalPages = Math.ceil(wallets.length / itemsPerPage);
@@ -237,6 +427,11 @@ export default function App() {
                   <span className="text-xs sm:text-sm font-mono text-white/70">
                     {userAddress?.slice(0, 6)}...{userAddress?.slice(-4)}
                   </span>
+                  {walletBalance && (
+                    <span className="text-[10px] text-emerald-400 font-semibold">
+                      {walletBalance} ETH
+                    </span>
+                  )}
                 </div>
                 <button 
                   onClick={disconnectWallet}
@@ -256,6 +451,56 @@ export default function App() {
             )}
           </motion.div>
         </div>
+
+        {/* Network Indicator & Transfer Mode Toggle */}
+        {signer && wallets.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="flex flex-col sm:flex-row items-center gap-4 justify-between bg-white/3 backdrop-blur-xl border border-white/10 rounded-2xl p-4"
+          >
+            {/* Network Status */}
+            <div className="flex items-center gap-2 px-4 py-2 bg-white/5 border border-white/10 rounded-xl">
+              <Network size={16} className={chainId === EXPECTED_CHAIN_ID ? "text-emerald-400" : "text-orange-400"} />
+              <span className="text-xs font-medium">
+                {chainId === EXPECTED_CHAIN_ID ? (
+                  <span className="text-emerald-400">Ethereum Mainnet</span>
+                ) : chainId ? (
+                  <span className="text-orange-400">Wrong Network (Chain ID: {chainId})</span>
+                ) : (
+                  <span className="text-white/40">Detecting...</span>
+                )}
+              </span>
+            </div>
+
+            {/* Transfer Mode Toggle */}
+            <div className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-xl p-1">
+              <button
+                onClick={() => setTransferMode('individual')}
+                className={cn(
+                  "px-4 py-2 rounded-lg text-xs font-semibold transition-all",
+                  transferMode === 'individual'
+                    ? "bg-blue-500 text-white shadow-lg shadow-blue-500/20"
+                    : "text-white/40 hover:text-white/60"
+                )}
+              >
+                Individual
+              </button>
+              <button
+                onClick={() => setTransferMode('bulk')}
+                className={cn(
+                  "px-4 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5",
+                  transferMode === 'bulk'
+                    ? "bg-purple-500 text-white shadow-lg shadow-purple-500/20"
+                    : "text-white/40 hover:text-white/60"
+                )}
+              >
+                <Zap size={14} />
+                Bulk Contract
+              </button>
+            </div>
+          </motion.div>
+        )}
 
         <motion.div 
           initial={{ opacity: 0, scale: 0.95 }}
@@ -318,23 +563,43 @@ export default function App() {
                 <span className="text-white">Generate</span>
               </button>
 
-              <button 
-                onClick={fundAllWallets}
-                disabled={wallets.length === 0 || isFunding || !signer}
-                className={cn(
-                  "col-span-1 lg:col-span-1 px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
-                  signer 
-                    ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20 disabled:opacity-50" 
-                    : "bg-white/5 border border-white/10 text-white/20 cursor-not-allowed"
-                )}
-              >
-                {isFunding ? (
-                  <Loader2 size={20} className="animate-spin" />
-                ) : (
-                  <Coins size={20} className="" />
-                )}
-                <span>{isFunding ? 'Funding' : 'Fund All'}</span>
-              </button>
+              {transferMode === 'individual' ? (
+                <button 
+                  onClick={fundAllWallets}
+                  disabled={wallets.length === 0 || isFunding || !signer}
+                  className={cn(
+                    "col-span-1 lg:col-span-1 px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
+                    signer 
+                      ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20 disabled:opacity-50" 
+                      : "bg-white/5 border border-white/10 text-white/20 cursor-not-allowed"
+                  )}
+                >
+                  {isFunding ? (
+                    <Loader2 size={20} className="animate-spin" />
+                  ) : (
+                    <Coins size={20} className="" />
+                  )}
+                  <span>{isFunding ? 'Funding' : 'Fund All'}</span>
+                </button>
+              ) : (
+                <button 
+                  onClick={handleBulkTransfer}
+                  disabled={wallets.length === 0 || isBulkTransferring || !signer || chainId !== EXPECTED_CHAIN_ID}
+                  className={cn(
+                    "col-span-1 lg:col-span-1 px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
+                    signer && chainId === EXPECTED_CHAIN_ID
+                      ? "bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-600/20 disabled:opacity-50" 
+                      : "bg-white/5 border border-white/10 text-white/20 cursor-not-allowed"
+                  )}
+                >
+                  {isBulkTransferring ? (
+                    <Loader2 size={20} className="animate-spin" />
+                  ) : (
+                    <Zap size={20} />
+                  )}
+                  <span>{isBulkTransferring ? 'Sending' : 'Bulk Send'}</span>
+                </button>
+              )}
 
               {wallets.length > 0 && (
                 <div className="col-span-1 lg:col-span-1 flex gap-2">
@@ -356,7 +621,13 @@ export default function App() {
                   </Tooltip>
                   <Tooltip text="Clear All">
                     <button 
-                      onClick={() => { setWallets([]); setCurrentPage(1); }}
+                      onClick={() => { 
+                        // Current session is already in history, just clear UI
+                        setWallets([]); 
+                        setCurrentPage(1); 
+                        setBulkTxHash(null); 
+                        setCurrentSessionId(null);
+                      }}
                       className="flex-1 p-3 sm:p-4 bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 rounded-xl transition-all flex items-center justify-center"
                     >
                       <Trash2 size={20} className="text-red-400" />
@@ -366,6 +637,32 @@ export default function App() {
               )}
             </div>
           </div>
+          
+          {/* Bulk Transfer Info */}
+          {bulkTxHash && (
+            <motion.div
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 bg-purple-500/10 border border-purple-500/20 rounded-xl"
+            >
+              <div className="flex items-center gap-3">
+                <Zap size={20} className="text-purple-400" />
+                <div>
+                  <p className="text-sm font-semibold text-purple-400">Bulk Transfer Transaction</p>
+                  <p className="text-xs text-white/60 font-mono">{bulkTxHash.slice(0, 10)}...{bulkTxHash.slice(-8)}</p>
+                </div>
+              </div>
+              <a
+                href={`https://etherscan.io/tx/${bulkTxHash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-4 py-2 bg-purple-500/20 hover:bg-purple-500/30 rounded-lg transition-colors text-purple-400 text-sm font-medium"
+              >
+                View on Etherscan
+                <ExternalLink size={16} />
+              </a>
+            </motion.div>
+          )}
         </motion.div>
 
         {/* Wallets List */}
@@ -612,6 +909,198 @@ export default function App() {
             </button>
           </motion.div>
         )}
+
+        {/* History Section */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-5 sm:p-8"
+        >
+            <button
+              onClick={() => setShowHistory(!showHistory)}
+              className="w-full flex items-center justify-between mb-6"
+            >
+              <div className="flex items-center gap-3">
+                <History size={24} className="text-blue-400" />
+                <h2 className="text-2xl font-bold">Wallet History</h2>
+                <span className="px-3 py-1 bg-blue-500/20 text-blue-400 rounded-full text-sm font-semibold">
+                  {history.length} {history.length === 1 ? 'Session' : 'Sessions'}
+                </span>
+              </div>
+              {showHistory ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
+            </button>
+
+            <AnimatePresence>
+              {showHistory && history.length > 0 && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="space-y-4"
+                >
+                  {history.map((session) => {
+                    const stats = getSessionStats(session);
+                    const isExpanded = expandedSessions.has(session.id);
+                    const date = new Date(session.timestamp);
+
+                    return (
+                      <motion.div
+                        key={session.id}
+                        initial={{ opacity: 0, y: -10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="bg-white/3 border border-white/10 rounded-2xl p-4 sm:p-5"
+                      >
+                        {/* Session Header */}
+                        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-4">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 mb-2">
+                              <span className="text-sm font-semibold text-white/80">
+                                {date.toLocaleDateString()} {date.toLocaleTimeString()}
+                              </span>
+                              {session.transferMode === 'bulk' && (
+                                <span className="px-2 py-0.5 bg-purple-500/20 text-purple-400 rounded text-xs font-semibold flex items-center gap-1">
+                                  <Zap size={12} />
+                                  Bulk
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-4 text-xs text-white/60">
+                              <span>{stats.total} wallets</span>
+                              <span className="text-emerald-400">{stats.successful} successful</span>
+                              {stats.failed > 0 && <span className="text-red-400">{stats.failed} failed</span>}
+                            </div>
+                          </div>
+
+                          {/* Actions */}
+                          <div className="flex items-center gap-2">
+                            <Tooltip text="Restore Session">
+                              <button
+                                onClick={() => restoreSession(session)}
+                                className="p-2 bg-blue-500/20 hover:bg-blue-500/30 rounded-lg transition-colors"
+                              >
+                                <RotateCcw size={16} className="text-blue-400" />
+                              </button>
+                            </Tooltip>
+                            <Tooltip text="Export CSV">
+                              <button
+                                onClick={() => exportSessionToCSV(session)}
+                                className="p-2 bg-emerald-500/20 hover:bg-emerald-500/30 rounded-lg transition-colors"
+                              >
+                                <Download size={16} className="text-emerald-400" />
+                              </button>
+                            </Tooltip>
+                            <Tooltip text="Export JSON">
+                              <button
+                                onClick={() => exportSessionToJSON(session)}
+                                className="p-2 bg-orange-500/20 hover:bg-orange-500/30 rounded-lg transition-colors"
+                              >
+                                <FileJson size={16} className="text-orange-400" />
+                              </button>
+                            </Tooltip>
+                            <Tooltip text="Delete Session">
+                              <button
+                                onClick={() => handleDeleteSession(session.id)}
+                                className="p-2 bg-red-500/20 hover:bg-red-500/30 rounded-lg transition-colors"
+                              >
+                                <Trash2 size={16} className="text-red-400" />
+                              </button>
+                            </Tooltip>
+                            <button
+                              onClick={() => toggleSessionExpand(session.id)}
+                              className="p-2 bg-white/5 hover:bg-white/10 rounded-lg transition-colors"
+                            >
+                              {isExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Bulk Transaction Hash */}
+                        {session.bulkTxHash && (
+                          <div className="mb-4 p-3 bg-purple-500/10 border border-purple-500/20 rounded-lg flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <Zap size={16} className="text-purple-400" />
+                              <span className="text-xs text-white/60 font-mono">
+                                {session.bulkTxHash.slice(0, 10)}...{session.bulkTxHash.slice(-8)}
+                              </span>
+                            </div>
+                            <a
+                              href={`https://etherscan.io/tx/${session.bulkTxHash}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-purple-400 hover:text-purple-300 transition-colors"
+                            >
+                              <ExternalLink size={14} />
+                            </a>
+                          </div>
+                        )}
+
+                        {/* Expanded Wallet List */}
+                        <AnimatePresence>
+                          {isExpanded && (
+                            <motion.div
+                              initial={{ opacity: 0, height: 0 }}
+                              animate={{ opacity: 1, height: 'auto' }}
+                              exit={{ opacity: 0, height: 0 }}
+                              className="space-y-2 pt-4 border-t border-white/10"
+                            >
+                              {session.wallets.slice(0, 10).map((wallet) => (
+                                <div
+                                  key={wallet.address}
+                                  className="flex items-center justify-between p-3 bg-white/3 rounded-lg text-xs"
+                                >
+                                  <div className="flex items-center gap-3 flex-1 min-w-0">
+                                    <span className="w-6 h-6 rounded bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-[10px] text-blue-400 shrink-0">
+                                      {wallet.index}
+                                    </span>
+                                    <code className="text-white/70 font-mono truncate">
+                                      {wallet.address}
+                                    </code>
+                                  </div>
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    {wallet.status === 'success' && (
+                                      <CheckCircle2 size={14} className="text-emerald-400" />
+                                    )}
+                                    {wallet.status === 'error' && (
+                                      <AlertCircle size={14} className="text-red-400" />
+                                    )}
+                                    {wallet.txHash && (
+                                      <a
+                                        href={`https://etherscan.io/tx/${wallet.txHash}`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-blue-400 hover:text-blue-300"
+                                      >
+                                        <ExternalLink size={12} />
+                                      </a>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                              {session.wallets.length > 10 && (
+                                <p className="text-center text-xs text-white/40 pt-2">
+                                  Showing 10 of {session.wallets.length} wallets. Export for full list.
+                                </p>
+                              )}
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </motion.div>
+                    );
+                  })}
+                </motion.div>
+              )}
+              {showHistory && history.length === 0 && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="text-center py-12 text-white/40"
+                >
+                  <History size={48} className="mx-auto mb-4 opacity-30" />
+                  <p className="text-sm">No wallet sessions yet. Generate wallets to start building your history.</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </motion.div>
 
         {wallets.length === 0 && (
           <motion.div 
