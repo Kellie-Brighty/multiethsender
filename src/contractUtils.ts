@@ -1,11 +1,54 @@
-import { Contract, parseEther, formatEther, type Signer } from 'ethers';
-import { MULTISEND_CONTRACT_ADDRESS, MULTISEND_ABI } from './contract';
+import { Contract, formatUnits, type Signer, type Provider, ZeroAddress, parseUnits } from 'ethers';
+import { MULTISEND_CONTRACT_ADDRESS, MULTISEND_ABI, ERC20_ABI } from './contract';
 import type { GeneratedWallet } from './utils';
 
 export interface BulkTransferResult {
   success: boolean;
   txHash?: string;
   error?: string;
+}
+
+export interface TokenInfo {
+  symbol: string;
+  decimals: number;
+  balance: string;
+  allowance: string;
+}
+
+/**
+ * Get the contract owner address
+ */
+export async function getContractOwner(signerOrProvider: Signer | Provider): Promise<string> {
+  const contract = new Contract(MULTISEND_CONTRACT_ADDRESS, MULTISEND_ABI, signerOrProvider);
+  return await contract.owner();
+}
+
+/**
+ * Check if platform fees are currently enabled
+ */
+export async function isFeesEnabled(signerOrProvider: Signer | Provider): Promise<boolean> {
+  const contract = new Contract(MULTISEND_CONTRACT_ADDRESS, MULTISEND_ABI, signerOrProvider);
+  return await contract.feesEnabled();
+}
+
+/**
+ * Toggle platform fees (Owner only)
+ */
+export async function toggleFees(signer: Signer): Promise<BulkTransferResult> {
+  try {
+    const contract = getMultiSendContract(signer);
+    const tx = await contract.toggleFees();
+    return {
+      success: true,
+      txHash: tx.hash,
+    };
+  } catch (error: any) {
+    console.error('Error toggling fees:', error);
+    return {
+      success: false,
+      error: error?.reason || error?.message || 'Transaction failed',
+    };
+  }
 }
 
 /**
@@ -16,27 +59,104 @@ export function getMultiSendContract(signer: Signer): Contract {
 }
 
 /**
+ * Get ERC20 contract instance
+ */
+export function getERC20Contract(tokenAddress: string, signerOrProvider: Signer | Provider): Contract {
+  return new Contract(tokenAddress, ERC20_ABI, signerOrProvider);
+}
+
+/**
+ * Get token information
+ */
+export async function getTokenInfo(
+  tokenAddress: string,
+  ownerAddress: string,
+  provider: Provider
+): Promise<TokenInfo | null> {
+  try {
+    const contract = getERC20Contract(tokenAddress, provider);
+    const [symbol, decimals, balance, allowance] = await Promise.all([
+      contract.symbol(),
+      contract.decimals(),
+      contract.balanceOf(ownerAddress),
+      contract.allowance(ownerAddress, MULTISEND_CONTRACT_ADDRESS),
+    ]);
+
+    return {
+      symbol,
+      decimals: Number(decimals),
+      balance: balance.toString(),
+      allowance: allowance.toString(),
+    };
+  } catch (error) {
+    console.error('Error fetching token info:', error);
+    return null;
+  }
+}
+
+/**
+ * Approve token spending
+ */
+export async function approveToken(
+  tokenAddress: string,
+  amount: bigint,
+  signer: Signer
+): Promise<BulkTransferResult> {
+  try {
+    const contract = getERC20Contract(tokenAddress, signer);
+    const tx = await contract.approve(MULTISEND_CONTRACT_ADDRESS, amount);
+    await tx.wait();
+    return { success: true, txHash: tx.hash };
+  } catch (error: any) {
+    return {
+      success: false,
+      error: error?.reason || error?.message || 'Approval failed',
+    };
+  }
+}
+
+/**
  * Send equal amounts to all wallets using the smart contract
  */
 export async function sendEqualAmounts(
   signer: Signer,
   recipients: string[],
-  totalAmount: string
+  totalAmount: string,
+  tokenAddress: string = ZeroAddress,
+  decimals: number = 18
 ): Promise<BulkTransferResult> {
   try {
     if (recipients.length === 0) {
       return { success: false, error: 'No recipients provided' };
     }
 
-    if (recipients.length > 200) {
-      return { success: false, error: 'Maximum 200 recipients allowed' };
-    }
-
     const contract = getMultiSendContract(signer);
-    const value = parseEther(totalAmount);
+    const amountInUnits = parseUnits(totalAmount, decimals);
+    
+    // Get current fee
+    const fee = await contract.getCurrentFee();
 
-    // Call the contract function
-    const tx = await contract.sendEqualAmounts(recipients, { value });
+    let tx;
+    if (tokenAddress === ZeroAddress) {
+      // ETH Transfer
+      tx = await contract.sendEqualAmountsETH(recipients, { 
+        value: amountInUnits + fee,
+        gasLimit: 300000 + (recipients.length * 50000) // Fallback gas limit
+      });
+    } else {
+      // ERC20 Transfer
+      // Note: USDT (and others) may fail during gas estimation in standard contracts
+      // because they don't return a boolean on transferFrom/transfer.
+      try {
+        tx = await contract.sendEqualAmountsERC20(tokenAddress, recipients, amountInUnits, { value: fee });
+      } catch (estError) {
+        console.warn('Gas estimation failed, trying with manual limit...', estError);
+        tx = await contract.sendEqualAmountsERC20(tokenAddress, recipients, amountInUnits, { 
+          value: fee,
+          gasLimit: 500000 + (recipients.length * 70000) 
+        });
+      }
+    }
     
     return {
       success: true,
@@ -44,16 +164,9 @@ export async function sendEqualAmounts(
     };
   } catch (error: any) {
     console.error('Error sending equal amounts:', error);
-    
-    const errorMessage =
-      error?.info?.error?.message ||
-      error?.reason ||
-      error?.message ||
-      'Transaction failed';
-    
     return {
       success: false,
-      error: errorMessage,
+      error: error?.reason || error?.message || 'Transaction failed',
     };
   }
 }
@@ -64,33 +177,41 @@ export async function sendEqualAmounts(
 export async function sendDifferentAmounts(
   signer: Signer,
   recipients: string[],
-  amounts: string[]
+  amounts: string[],
+  tokenAddress: string = ZeroAddress,
+  decimals: number = 18
 ): Promise<BulkTransferResult> {
   try {
     if (recipients.length === 0) {
       return { success: false, error: 'No recipients provided' };
     }
 
-    if (recipients.length !== amounts.length) {
-      return { success: false, error: 'Recipients and amounts length mismatch' };
-    }
-
-    if (recipients.length > 200) {
-      return { success: false, error: 'Maximum 200 recipients allowed' };
-    }
-
     const contract = getMultiSendContract(signer);
+    const amountsInUnits = amounts.map(amount => parseUnits(amount, decimals));
+    const totalAmount = amountsInUnits.reduce((sum, amount) => sum + amount, 0n);
     
-    // Convert amounts to Wei
-    const amountsInWei = amounts.map(amount => parseEther(amount));
-    
-    // Calculate total amount needed
-    const totalAmount = amountsInWei.reduce((sum, amount) => sum + amount, 0n);
+    // Get current fee
+    const fee = await contract.getCurrentFee();
 
-    // Call the contract function
-    const tx = await contract.sendDifferentAmounts(recipients, amountsInWei, {
-      value: totalAmount,
-    });
+    let tx;
+    if (tokenAddress === ZeroAddress) {
+      // ETH Transfer
+      tx = await contract.sendDifferentAmountsETH(recipients, amountsInUnits, {
+        value: totalAmount + fee,
+        gasLimit: 300000 + (recipients.length * 50000)
+      });
+    } else {
+      // ERC20 Transfer
+      try {
+        tx = await contract.sendDifferentAmountsERC20(tokenAddress, recipients, amountsInUnits, { value: fee });
+      } catch (estError) {
+        console.warn('Gas estimation failed, trying with manual limit...', estError);
+        tx = await contract.sendDifferentAmountsERC20(tokenAddress, recipients, amountsInUnits, { 
+          value: fee,
+          gasLimit: 500000 + (recipients.length * 70000)
+        });
+      }
+    }
     
     return {
       success: true,
@@ -98,59 +219,38 @@ export async function sendDifferentAmounts(
     };
   } catch (error: any) {
     console.error('Error sending different amounts:', error);
-    
-    const errorMessage =
-      error?.info?.error?.message ||
-      error?.reason ||
-      error?.message ||
-      'Transaction failed';
-    
     return {
       success: false,
-      error: errorMessage,
+      error: error?.reason || error?.message || 'Transaction failed',
     };
   }
 }
 
 /**
- * Estimate gas for equal amounts transfer
+ * Estimate gas (simplified for ERC20/ETH)
  */
-export async function estimateGasForEqualAmounts(
+export async function estimateGas(
   signer: Signer,
   recipients: string[],
-  totalAmount: string
+  amounts: string[],
+  tokenAddress: string = ZeroAddress,
+  decimals: number = 18
 ): Promise<bigint | null> {
   try {
     const contract = getMultiSendContract(signer);
-    const value = parseEther(totalAmount);
-    
-    const gasEstimate = await contract.sendEqualAmounts.estimateGas(recipients, { value });
-    return gasEstimate;
-  } catch (error) {
-    console.error('Error estimating gas:', error);
-    return null;
-  }
-}
+    const amountsInUnits = amounts.map(amount => parseUnits(amount, decimals));
+    const totalAmount = amountsInUnits.reduce((sum, amount) => sum + amount, 0n);
+    const fee = await contract.getCurrentFee();
 
-/**
- * Estimate gas for different amounts transfer
- */
-export async function estimateGasForDifferentAmounts(
-  signer: Signer,
-  recipients: string[],
-  amounts: string[]
-): Promise<bigint | null> {
-  try {
-    const contract = getMultiSendContract(signer);
-    const amountsInWei = amounts.map(amount => parseEther(amount));
-    const totalAmount = amountsInWei.reduce((sum, amount) => sum + amount, 0n);
-    
-    const gasEstimate = await contract.sendDifferentAmounts.estimateGas(
-      recipients,
-      amountsInWei,
-      { value: totalAmount }
-    );
-    return gasEstimate;
+    if (tokenAddress === ZeroAddress) {
+      return await contract.sendDifferentAmountsETH.estimateGas(recipients, amountsInUnits, {
+        value: totalAmount + fee,
+      });
+    } else {
+      return await contract.sendDifferentAmountsERC20.estimateGas(tokenAddress, recipients, amountsInUnits, {
+        value: fee,
+      });
+    }
   } catch (error) {
     console.error('Error estimating gas:', error);
     return null;
@@ -167,11 +267,11 @@ export function prepareRecipientsFromWallets(wallets: GeneratedWallet[]): string
 /**
  * Calculate total amount for equal distribution
  */
-export function calculateTotalAmount(amountPerWallet: string, walletCount: number): string {
+export function calculateTotalAmount(amountPerWallet: string, walletCount: number, decimals: number = 18): string {
   try {
-    const amountInWei = parseEther(amountPerWallet);
-    const total = amountInWei * BigInt(walletCount);
-    return formatEther(total);
+    const amountInUnits = parseUnits(amountPerWallet, decimals);
+    const total = amountInUnits * BigInt(walletCount);
+    return formatUnits(total, decimals);
   } catch (error) {
     console.error('Error calculating total amount:', error);
     return '0';
