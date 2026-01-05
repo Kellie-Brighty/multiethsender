@@ -1,84 +1,54 @@
 import { useState, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
 import { 
-  Plus, 
-  Trash2, 
-  Copy, 
-  Wallet as WalletIcon, 
-  CheckCircle2,
-  FileJson,
-  FileSpreadsheet,
-  Link,
-  Unlink,
-  Coins,
-  Loader2,
-  ExternalLink,
-  AlertCircle,
-  Save,
-  EyeOff,
-  Eye,
-  Zap,
-  Network,
-  History,
-  ChevronDown,
-  ChevronUp,
-  Download,
-  RotateCcw
-} from 'lucide-react';
-import { clsx, type ClassValue } from 'clsx';
-import { twMerge } from 'tailwind-merge';
-import { BrowserProvider, parseEther, type Signer } from 'ethers';
-import { generateWallets, exportToCSV, exportToJSON, type GeneratedWallet } from './utils';
-import { sendEqualAmounts, sendDifferentAmounts, prepareRecipientsFromWallets, calculateTotalAmount } from './contractUtils';
+  BrowserProvider, 
+  Contract, 
+  parseEther, 
+  formatEther, 
+  type Signer, 
+  ZeroAddress, 
+  parseUnits 
+} from 'ethers';
+import { 
+  generateWallets, 
+  exportToCSV, 
+  exportToJSON, 
+  type GeneratedWallet 
+} from './utils';
+import { 
+  sendEqualAmounts, 
+  sendDifferentAmounts, 
+  toggleFees,
+  prepareRecipientsFromWallets, 
+  getTokenInfo, 
+  approveToken,
+  calculateTotalAmount,
+  getMultiSendContract,
+  type TokenInfo 
+} from './contractUtils';
 import { EXPECTED_CHAIN_ID } from './contract';
+import { POPULAR_TOKENS, getCustomTokens, saveCustomToken, type TokenDefinition } from './tokens';
 import { 
   getWalletHistory, 
   addSessionToHistory, 
   updateSessionInHistory, 
   deleteSessionFromHistory,
-  getSessionStats,
   exportSessionToCSV,
   exportSessionToJSON,
-  formatRelativeTime,
   type WalletSession 
 } from './historyUtils';
+
+// Sub-components
+import { Header } from './components/Header';
+import { ConfigCard } from './components/ConfigCard';
+import { WalletList } from './components/WalletList';
+import { HistorySection } from './components/HistorySection';
+import { AdminControl } from './components/AdminControl';
 
 declare global {
   interface Window {
     ethereum?: any;
   }
 }
-
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
-
-const Tooltip = ({ text, children }: { text: string; children: React.ReactNode }) => {
-  const [show, setShow] = useState(false);
-
-  return (
-    <div 
-      className="relative flex items-center"
-      onMouseEnter={() => setShow(true)}
-      onMouseLeave={() => setShow(false)}
-    >
-      {children}
-      <AnimatePresence>
-        {show && (
-          <motion.div
-            initial={{ opacity: 0, scale: 0.9, y: 5 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.9, y: 5 }}
-            className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 px-2 py-1 bg-white/10 backdrop-blur-md border border-white/10 rounded-lg text-[10px] font-medium text-white whitespace-nowrap pointer-events-none z-50 shadow-xl"
-          >
-            {text}
-            <div className="absolute top-full left-1/2 -translate-x-1/2 border-x-4 border-x-transparent border-t-4 border-t-white/10" />
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-};
 
 export default function App() {
   const [count, setCount] = useState<number | string>(1);
@@ -93,6 +63,7 @@ export default function App() {
   const [userAddress, setUserAddress] = useState<string | null>(null);
   const [fundingAmount, setFundingAmount] = useState<string>("0.01");
   const [isFunding, setIsFunding] = useState(false);
+  const [isAmountSynced, setIsAmountSynced] = useState(true);
   
   // Smart Contract Bulk Transfer State
   const [transferMode, setTransferMode] = useState<'individual' | 'bulk'>('individual');
@@ -106,6 +77,44 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set());
   const [walletBalance, setWalletBalance] = useState<string | null>(null);
+  
+  // Asset & ERC20 State
+  const [assetType, setAssetType] = useState<'ETH' | 'ERC20'>('ETH');
+  const [tokenAddress, setTokenAddress] = useState<string>('');
+  const [tokenInfo, setTokenInfo] = useState<TokenInfo | null>(null);
+  const [isApproving, setIsApproving] = useState(false);
+  const [platformFee, setPlatformFee] = useState<string>('0');
+  const [feesEnabled, setFeesEnabled] = useState<boolean>(true);
+  const [isOwner, setIsOwner] = useState<boolean>(false);
+  const [isTogglingFees, setIsTogglingFees] = useState<boolean>(false);
+
+  // Discovered Tokens Search
+  const [discoveredTokens, setDiscoveredTokens] = useState<(TokenDefinition & { balance?: string })[]>([]);
+  const [showTokenSelector, setShowTokenSelector] = useState(false);
+  const [tokenSearchTerm, setTokenSearchTerm] = useState('');
+  
+  const handleAddCustomToken = async (address: string) => {
+    if (address.length === 42 && signer && userAddress) {
+      try {
+        const provider = new BrowserProvider(window.ethereum!);
+        const info = await getTokenInfo(address, userAddress, provider);
+        if (info) {
+          const newToken: TokenDefinition = {
+            address,
+            symbol: info.symbol,
+            decimals: info.decimals,
+          };
+          saveCustomToken(newToken);
+          setTokenAddress(address);
+          setTokenSearchTerm('');
+          setShowTokenSelector(false);
+          await scanTokens();
+        }
+      } catch (e) {
+        alert('Could not find token at this address');
+      }
+    }
+  };
 
   // Load history on mount
   useEffect(() => {
@@ -131,6 +140,18 @@ export default function App() {
       }
     }
   }, []);
+  
+  // Sync amounts effect
+  useEffect(() => {
+    if (isAmountSynced && wallets.length > 0 && !isFunding && !isBulkTransferring) {
+      setWallets(prev => prev.map(w => {
+        if (w.amount !== fundingAmount) {
+          return { ...w, amount: fundingAmount, status: 'idle' };
+        }
+        return w;
+      }));
+    }
+  }, [fundingAmount, isAmountSynced, isFunding, isBulkTransferring]);
 
   useEffect(() => {
     if (wallets.length > 0) {
@@ -174,6 +195,17 @@ export default function App() {
         const balance = await provider.getBalance(address);
         const balanceInEth = (Number(balance) / 1e18).toFixed(4);
         setWalletBalance(balanceInEth);
+
+        // Fetch current fee from contract
+        const contract = getMultiSendContract(newSigner);
+        const [fee, enabled, ownerAddress] = await Promise.all([
+          contract.getCurrentFee(),
+          contract.feesEnabled(),
+          contract.owner()
+        ]);
+        setPlatformFee(formatEther(fee));
+        setFeesEnabled(enabled);
+        setIsOwner(ownerAddress.toLowerCase() === address.toLowerCase());
       } catch (err) {
         console.error("User rejected the connection", err);
       }
@@ -190,18 +222,105 @@ export default function App() {
     setWalletBalance(null);
   };
 
+  const handleToggleFees = async () => {
+    if (!signer || !isOwner) return;
+    setIsTogglingFees(true);
+    try {
+      const result = await toggleFees(signer);
+      if (result.success) {
+        // Optimistic update or refresh
+        await refreshBalance();
+      } else {
+        alert(`Failed to toggle fees: ${result.error}`);
+      }
+    } catch (error) {
+      console.error('Error in handleToggleFees:', error);
+    }
+    setIsTogglingFees(false);
+  };
+
   const refreshBalance = async () => {
     if (signer && userAddress) {
       try {
         const provider = new BrowserProvider(window.ethereum!);
-        const balance = await provider.getBalance(userAddress);
-        const balanceInEth = (Number(balance) / 1e18).toFixed(4);
-        setWalletBalance(balanceInEth);
+        const contract = getMultiSendContract(signer);
+        const [balance, fee, enabled] = await Promise.all([
+          provider.getBalance(userAddress),
+          contract.getCurrentFee(),
+          contract.feesEnabled()
+        ]);
+        
+        setWalletBalance((Number(balance) / 1e18).toFixed(4));
+        setPlatformFee(formatEther(fee));
+        setFeesEnabled(enabled);
+
+        // Also refresh token info if applicable
+        if (assetType === 'ERC20' && tokenAddress) {
+          const info = await getTokenInfo(tokenAddress, userAddress, provider);
+          setTokenInfo(info);
+        }
       } catch (error) {
         console.error('Failed to refresh balance:', error);
       }
     }
   };
+
+  // Scan for token balances
+  const scanTokens = async () => {
+    if (!signer || !userAddress) return;
+    
+    try {
+      const provider = new BrowserProvider(window.ethereum!);
+      const customOnes = getCustomTokens();
+      const allToScan = [...POPULAR_TOKENS, ...customOnes];
+      
+      const results = await Promise.all(
+        allToScan.map(async (token) => {
+          try {
+            const info = await getTokenInfo(token.address, userAddress, provider);
+            // Only add discovered tokens that actually have a balance
+            if (info && BigInt(info.balance) > 0n) {
+              return { ...token, balance: info.balance };
+            }
+            return null;
+          } catch (e) {
+            return null;
+          }
+        })
+      );
+
+      const filtered = results.filter((t): t is (TokenDefinition & { balance: string }) => t !== null);
+      setDiscoveredTokens(filtered);
+    } catch (error) {
+      console.error('Failed to scan tokens:', error);
+    }
+  };
+
+  // Rescan tokens when connecting or switching to ERC20
+  useEffect(() => {
+    if (signer && userAddress && assetType === 'ERC20') {
+      scanTokens();
+    }
+  }, [signer, userAddress, assetType]);
+
+  // Fetch token info when address changes
+  useEffect(() => {
+    const fetchToken = async () => {
+      if (assetType === 'ERC20' && tokenAddress.length === 42 && signer && userAddress) {
+        try {
+          const provider = new BrowserProvider(window.ethereum!);
+          const info = await getTokenInfo(tokenAddress, userAddress, provider);
+          setTokenInfo(info);
+        } catch (error) {
+          console.error('Failed to fetch token info:', error);
+          setTokenInfo(null);
+        }
+      } else {
+        setTokenInfo(null);
+      }
+    };
+    fetchToken();
+  }, [tokenAddress, assetType, signer, userAddress]);
 
   const handleGenerate = () => {
     const num = typeof count === 'string' ? parseInt(count) || 1 : count;
@@ -233,8 +352,31 @@ export default function App() {
     console.log('History updated:', updatedHistory.sessions.length);
   };
 
+  const validateWallets = (): boolean => {
+    let hasError = false;
+    const updatedWallets = wallets.map(w => {
+      const amount = parseFloat(w.amount || '0');
+      if (amount <= 0 || isNaN(amount)) {
+        hasError = true;
+        return { ...w, status: 'error' as const, error: 'Enter a valid amount > 0' };
+      }
+      return w;
+    });
+
+    if (hasError) {
+      setWallets(updatedWallets);
+      alert('Some wallets have invalid or empty amounts. Please fix them before funding.');
+      return false;
+    }
+    return true;
+  };
+
   const fundAllWallets = async () => {
     if (!signer) return;
+    
+    // Validate before starting
+    if (!validateWallets()) return;
+
     setIsFunding(true);
 
     const updatedWallets = [...wallets];
@@ -247,10 +389,22 @@ export default function App() {
         updatedWallets[i] = { ...wallet, status: 'pending' };
         setWallets([...updatedWallets]);
 
-        const tx = await signer.sendTransaction({
-          to: wallet.address,
-          value: parseEther(wallet.amount),
-        });
+        const isETH = assetType === 'ETH';
+        const decimals = isETH ? 18 : tokenInfo?.decimals || 18;
+        
+        let tx;
+        if (isETH) {
+          tx = await signer.sendTransaction({
+            to: wallet.address,
+            value: parseEther(wallet.amount),
+          });
+        } else {
+          // ERC20 Transfer
+          const tokenContract = new Contract(tokenAddress, [
+            'function transfer(address to, uint256 amount) public returns (bool)'
+          ], signer);
+          tx = await tokenContract.transfer(wallet.address, parseUnits(wallet.amount, decimals));
+        }
 
         updatedWallets[i] = { ...updatedWallets[i], status: 'pending', txHash: tx.hash };
         setWallets([...updatedWallets]);
@@ -280,6 +434,9 @@ export default function App() {
 
   const handleBulkTransfer = async () => {
     if (!signer) return;
+
+    // Validate before starting
+    if (!validateWallets()) return;
     
     // Check if on correct network
     if (chainId !== EXPECTED_CHAIN_ID) {
@@ -292,18 +449,42 @@ export default function App() {
 
     try {
       const recipients = prepareRecipientsFromWallets(wallets);
-      
+      const isETH = assetType === 'ETH';
+      const decimals = isETH ? 18 : tokenInfo?.decimals || 18;
+      const tAddress = isETH ? ZeroAddress : tokenAddress;
+
+      // Handle ERC20 Approval if needed
+      if (!isETH && tokenInfo) {
+        const totalNeeded = parseUnits(
+          calculateTotalAmount(wallets[0].amount, wallets.length, decimals),
+          decimals
+        );
+        
+        if (BigInt(tokenInfo.allowance) < totalNeeded) {
+          setIsApproving(true);
+          const approveRes = await approveToken(tokenAddress, totalNeeded, signer);
+          setIsApproving(false);
+          if (!approveRes.success) {
+            alert(`Approval failed: ${approveRes.error}`);
+            setIsBulkTransferring(false);
+            return;
+          }
+          // Refresh token info to update allowance
+          await refreshBalance();
+        }
+      }
+
       // Check if all amounts are the same
       const firstAmount = wallets[0].amount;
       const allSame = wallets.every(w => w.amount === firstAmount);
 
       let result;
       if (allSame) {
-        const totalAmount = calculateTotalAmount(firstAmount, wallets.length);
-        result = await sendEqualAmounts(signer, recipients, totalAmount);
+        const totalAmount = calculateTotalAmount(firstAmount, wallets.length, decimals);
+        result = await sendEqualAmounts(signer, recipients, totalAmount, tAddress, decimals);
       } else {
         const amounts = wallets.map(w => w.amount);
-        result = await sendDifferentAmounts(signer, recipients, amounts);
+        result = await sendDifferentAmounts(signer, recipients, amounts, tAddress, decimals);
       }
 
       if (result.success && result.txHash) {
@@ -343,8 +524,9 @@ export default function App() {
   };
 
   const updateWalletAmount = (index: number, newAmount: string) => {
+    setIsAmountSynced(false); // Turn off sync on manual edit
     setWallets(prev => prev.map(w => 
-      w.index === index ? { ...w, amount: newAmount } : w
+      w.index === index ? { ...w, amount: newAmount, status: 'idle' } : w
     ));
   };
 
@@ -403,757 +585,100 @@ export default function App() {
         <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-purple-600/10 blur-[120px] rounded-full" />
       </div>
 
-      <main className="relative z-10 w-full max-w-[1400px] space-y-8">
-        {/* Header Section */}
-        <div className="flex flex-col sm:flex-row justify-between items-center gap-6">
-          <div className="text-center sm:text-left space-y-4">
-            <motion.h1 
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.1 }}
-              className="text-4xl sm:text-5xl md:text-6xl font-bold tracking-tighter bg-linear-to-b from-white to-white/60 bg-clip-text text-transparent"
-            >
-              Ethos
-            </motion.h1>
-            <motion.p
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.2 }}
-              className="text-sm sm:text-base text-white/40 font-medium max-w-md leading-relaxed"
-            >
-              Generate, fund, and manage multiple Ethereum wallets in one seamless rhythm.
-            </motion.p>
-            {wallets.length > 0 && (
-              <motion.div 
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="flex items-center justify-center sm:justify-start gap-1.5 text-[10px] text-emerald-400/60 font-medium uppercase tracking-widest"
-              >
-                <Save size={12} />
-                Session Auto-Saved
-              </motion.div>
-            )}
-          </div>
+      <main className="relative z-10 w-full max-w-[1400px]">
+        <Header 
+          signer={signer}
+          userAddress={userAddress}
+          walletBalance={walletBalance}
+          chainId={chainId}
+          expectedChainId={EXPECTED_CHAIN_ID}
+          hasWallets={wallets.length > 0}
+          onConnect={connectWallet}
+          onDisconnect={disconnectWallet}
+        />
 
-          <motion.div
-            initial={{ opacity: 0, x: 20 }}
-            animate={{ opacity: 1, x: 0 }}
-            className="flex items-center gap-4 w-full sm:w-auto overflow-x-auto pb-1 sm:pb-0"
-          >
-            {signer ? (
-              <div className="flex items-center gap-3 bg-white/3 border border-white/10 rounded-2xl p-2 pr-4 min-w-max">
-                <div className="w-10 h-10 rounded-xl bg-blue-500/20 flex items-center justify-center text-blue-400 shrink-0">
-                  <WalletIcon size={20} />
-                </div>
-                <div className="flex flex-col">
-                  <span className="text-[10px] text-white/40 font-bold uppercase tracking-wider">Connected</span>
-                  <span className="text-xs sm:text-sm font-mono text-white/70">
-                    {userAddress?.slice(0, 6)}...{userAddress?.slice(-4)}
-                  </span>
-                  {walletBalance && (
-                    <span className="text-[10px] text-emerald-400 font-semibold">
-                      {walletBalance} ETH
-                    </span>
-                  )}
-                </div>
-                <button 
-                  onClick={disconnectWallet}
-                  className="ml-2 p-2 hover:bg-white/10 rounded-lg transition-colors text-white/40 hover:text-red-400"
-                >
-                  <Unlink size={18} />
-                </button>
-              </div>
-            ) : (
-              <button 
-                onClick={connectWallet}
-                className="w-full sm:w-auto flex items-center justify-center gap-2 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl font-semibold transition-all active:scale-95 group whitespace-nowrap"
-              >
-                <Link size={18} className="text-blue-400 group-hover:rotate-12 transition-transform" />
-                <span>Connect Wallet</span>
-              </button>
-            )}
-          </motion.div>
+        <AdminControl 
+          isOwner={isOwner}
+          feesEnabled={feesEnabled}
+          platformFee={platformFee}
+          isTogglingFees={isTogglingFees}
+          onToggleFees={handleToggleFees}
+        />
+
+        <ConfigCard 
+          assetType={assetType}
+          setAssetType={setAssetType}
+          count={count}
+          setCount={setCount}
+          fundingAmount={fundingAmount}
+          setFundingAmount={setFundingAmount}
+          handleGenerate={handleGenerate}
+          showTokenSelector={showTokenSelector}
+          setShowTokenSelector={setShowTokenSelector}
+          tokenAddress={tokenAddress}
+          tokenInfo={tokenInfo}
+          discoveredTokens={discoveredTokens}
+          tokenSearchTerm={tokenSearchTerm}
+          setTokenSearchTerm={setTokenSearchTerm}
+          onSelectToken={(token) => {
+            setTokenAddress(token.address);
+            setShowTokenSelector(false);
+            setTokenSearchTerm('');
+          }}
+          onAddCustomToken={handleAddCustomToken}
+        />
+
+        <div className="mt-12">
+          <WalletList 
+            wallets={wallets}
+            paginatedWallets={paginatedWallets}
+            showPrivateKeys={showPrivateKeys}
+            togglePrivateKey={togglePrivateKey}
+            copyToClipboard={copyToClipboard}
+            copiedIndex={copiedIndex}
+            updateWalletAmount={updateWalletAmount}
+            isFunding={isFunding}
+            isBulkTransferring={isBulkTransferring}
+            onFundAll={fundAllWallets}
+            onBulkTransfer={handleBulkTransfer}
+            transferMode={transferMode}
+            setTransferMode={setTransferMode}
+            assetType={assetType}
+            tokenInfo={tokenInfo}
+            platformFee={platformFee}
+            feesEnabled={feesEnabled}
+            isApproving={isApproving}
+            onExportCSV={() => exportToCSV(wallets)}
+            onExportJSON={() => exportToJSON(wallets)}
+            onClear={() => { 
+              setWallets([]); 
+              setCurrentPage(1); 
+              setBulkTxHash(null); 
+              setCurrentSessionId(null);
+              setIsAmountSynced(true); // Reset sync on clear
+            }}
+            isAmountSynced={isAmountSynced}
+            setIsAmountSynced={setIsAmountSynced}
+            currentPage={currentPage}
+            setCurrentPage={setCurrentPage}
+            totalPages={totalPages}
+          />
         </div>
 
-        {/* Network Indicator & Transfer Mode Toggle */}
-        {signer && wallets.length > 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: -10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="flex flex-col sm:flex-row items-center gap-4 justify-between bg-white/3 backdrop-blur-xl border border-white/10 rounded-2xl p-4"
-          >
-            {/* Network Status */}
-            <div className="flex items-center gap-2 px-4 py-2 bg-white/5 border border-white/10 rounded-xl">
-              <Network size={16} className={chainId === EXPECTED_CHAIN_ID ? "text-emerald-400" : "text-orange-400"} />
-              <span className="text-xs font-medium">
-                {chainId === EXPECTED_CHAIN_ID ? (
-                  <span className="text-emerald-400">Ethereum Mainnet</span>
-                ) : chainId ? (
-                  <span className="text-orange-400">Wrong Network (Chain ID: {chainId})</span>
-                ) : (
-                  <span className="text-white/40">Detecting...</span>
-                )}
-              </span>
-            </div>
+        <HistorySection 
+          showHistory={showHistory}
+          setShowHistory={setShowHistory}
+          history={history}
+          expandedSessions={expandedSessions}
+          toggleSessionExpand={toggleSessionExpand}
+          restoreSession={restoreSession}
+          handleDeleteSession={handleDeleteSession}
+          exportSessionToJSON={exportSessionToJSON}
+          exportSessionToCSV={exportSessionToCSV}
+        />
 
-            {/* Transfer Mode Toggle */}
-            <div className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-xl p-1">
-              <button
-                onClick={() => setTransferMode('individual')}
-                className={cn(
-                  "px-4 py-2 rounded-lg text-xs font-semibold transition-all",
-                  transferMode === 'individual'
-                    ? "bg-blue-500 text-white shadow-lg shadow-blue-500/20"
-                    : "text-white/40 hover:text-white/60"
-                )}
-              >
-                Individual
-              </button>
-              <button
-                onClick={() => setTransferMode('bulk')}
-                className={cn(
-                  "px-4 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5",
-                  transferMode === 'bulk'
-                    ? "bg-purple-500 text-white shadow-lg shadow-purple-500/20"
-                    : "text-white/40 hover:text-white/60"
-                )}
-              >
-                <Zap size={14} />
-                Bulk Contract
-              </button>
-            </div>
-          </motion.div>
-        )}
-
-        <motion.div 
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ delay: 0.3 }}
-          className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-5 sm:p-8"
-        >
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:flex lg:items-end gap-4 sm:gap-6">
-            <div className="space-y-3">
-              <label className="text-xs sm:text-sm font-medium text-white/60 ml-1">Number of Wallets</label>
-              <div className="relative group">
-                <input 
-                  type="number" 
-                  min="1" 
-                  max="500"
-                  value={count}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    if (val === '') {
-                      setCount('');
-                      return;
-                    }
-                    const parsed = parseInt(val);
-                    if (!isNaN(parsed)) {
-                      setCount(Math.min(500, parsed));
-                    }
-                  }}
-                  className="w-full bg-white/3 border border-white/10 rounded-xl px-4 py-3 sm:py-4 focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all text-base sm:text-lg font-mono focus:border-blue-500/50"
-                  placeholder="E.g. 10"
-                />
-                <div className="absolute right-4 top-1/2 -translate-y-1/2 text-white/30 group-focus-within:text-blue-400/50 transition-colors">
-                  <WalletIcon size={20} />
-                </div>
-              </div>
-            </div>
-
-            <div className="space-y-3">
-              <label className="text-xs sm:text-sm font-medium text-white/60 ml-1">Funding Amount (ETH)</label>
-              <div className="relative group">
-                <input 
-                  type="text" 
-                  value={fundingAmount}
-                  onChange={(e) => setFundingAmount(e.target.value)}
-                  className="w-full bg-white/3 border border-white/10 rounded-xl px-4 py-3 sm:py-4 focus:outline-none focus:ring-2 focus:ring-emerald-500/40 transition-all text-base sm:text-lg font-mono focus:border-emerald-500/50"
-                  placeholder="0.01"
-                  disabled={isFunding}
-                />
-                <div className="absolute right-4 top-1/2 -translate-y-1/2 text-white/30 group-focus-within:text-emerald-400/50 transition-colors">
-                  <Coins size={20} />
-                </div>
-              </div>
-            </div>
-
-            <div className="col-span-1 sm:col-span-2 lg:flex-1 flex flex-wrap items-end gap-3">
-              <button 
-                onClick={handleGenerate}
-                className="flex-2 min-w-[140px] px-6 py-3 sm:py-4 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-semibold transition-all shadow-lg shadow-blue-600/20 flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95"
-              >
-                <Plus size={20} className="group-hover:rotate-90 transition-transform duration-300" />
-                <span>Generate</span>
-              </button>
-
-              {transferMode === 'individual' ? (
-                <button 
-                  onClick={fundAllWallets}
-                  disabled={wallets.length === 0 || isFunding || !signer}
-                  className={cn(
-                    "flex-2 min-w-[140px] px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
-                    signer 
-                      ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20 disabled:opacity-50" 
-                      : "bg-white/5 border border-white/10 text-white/20 cursor-not-allowed"
-                  )}
-                >
-                  {isFunding ? (
-                    <Loader2 size={20} className="animate-spin" />
-                  ) : (
-                    <Coins size={20} />
-                  )}
-                  <span>{isFunding ? 'Funding' : 'Fund All'}</span>
-                </button>
-              ) : (
-                <button 
-                  onClick={handleBulkTransfer}
-                  disabled={wallets.length === 0 || isBulkTransferring || !signer || chainId !== EXPECTED_CHAIN_ID}
-                  className={cn(
-                    "flex-2 min-w-[140px] px-6 py-3 sm:py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 group whitespace-nowrap active:scale-95",
-                    signer && chainId === EXPECTED_CHAIN_ID
-                      ? "bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-600/20 disabled:opacity-50" 
-                      : "bg-white/5 border border-white/10 text-white/20 cursor-not-allowed"
-                  )}
-                >
-                  {isBulkTransferring ? (
-                    <Loader2 size={20} className="animate-spin" />
-                  ) : (
-                    <Zap size={20} />
-                  )}
-                  <span>{isBulkTransferring ? 'Sending' : 'Bulk Send'}</span>
-                </button>
-              )}
-
-              {wallets.length > 0 && (
-                <div className="flex gap-2">
-                  <Tooltip text="Export CSV">
-                    <button 
-                      onClick={() => exportToCSV(wallets)}
-                      className="p-3 sm:p-4 bg-white/8 hover:bg-white/15 border border-white/10 rounded-xl transition-all flex items-center justify-center shrink-0"
-                    >
-                      <FileSpreadsheet size={20} className="text-emerald-400" />
-                    </button>
-                  </Tooltip>
-                  <Tooltip text="Export JSON">
-                    <button 
-                      onClick={() => exportToJSON(wallets)}
-                      className="p-3 sm:p-4 bg-white/8 hover:bg-white/15 border border-white/10 rounded-xl transition-all flex items-center justify-center shrink-0"
-                    >
-                      <FileJson size={20} className="text-orange-400" />
-                    </button>
-                  </Tooltip>
-                  <Tooltip text="Clear All">
-                    <button 
-                      onClick={() => { 
-                        setWallets([]); 
-                        setCurrentPage(1); 
-                        setBulkTxHash(null); 
-                        setCurrentSessionId(null);
-                      }}
-                      className="p-3 sm:p-4 bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 rounded-xl transition-all flex items-center justify-center shrink-0"
-                    >
-                      <Trash2 size={20} className="text-red-400" />
-                    </button>
-                  </Tooltip>
-                </div>
-              )}
-            </div>
-          </div>
-          
-          {/* Bulk Transfer Info */}
-          {bulkTxHash && (
-            <motion.div
-              initial={{ opacity: 0, y: -10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="flex flex-col sm:flex-row items-center justify-between gap-4 p-4 bg-purple-500/10 border border-purple-500/20 rounded-xl"
-            >
-              <div className="flex items-center gap-3">
-                <Zap size={20} className="text-purple-400" />
-                <div>
-                  <p className="text-sm font-semibold text-purple-400">Bulk Transfer Transaction</p>
-                  <p className="text-xs text-white/60 font-mono">{bulkTxHash.slice(0, 10)}...{bulkTxHash.slice(-8)}</p>
-                </div>
-              </div>
-              <a
-                href={`https://etherscan.io/tx/${bulkTxHash}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 px-4 py-2 bg-purple-500/20 hover:bg-purple-500/30 rounded-lg transition-colors text-purple-400 text-sm font-medium"
-              >
-                View on Etherscan
-                <ExternalLink size={16} />
-              </a>
-            </motion.div>
-          )}
-        </motion.div>
-
-        {/* Wallets List */}
-        <div className="space-y-4">
-          <AnimatePresence mode="popLayout">
-            {paginatedWallets.map((wallet, idx) => (
-              <motion.div 
-                key={wallet.address}
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-                transition={{ delay: idx * 0.05 }}
-                className="group relative bg-white/2 hover:bg-white/4 backdrop-blur-md border border-white/5 hover:border-white/10 rounded-2xl p-4 sm:p-5 transition-all"
-              >
-                <div className="flex flex-col lg:flex-row lg:items-center gap-4 sm:gap-6">
-                  {/* Index */}
-                  <div className="flex items-center justify-between lg:justify-start lg:min-w-[80px]">
-                    <div className="flex items-center gap-3">
-                      <span className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-xs font-mono text-blue-400">
-                        {wallet.index}
-                      </span>
-                      <span className="lg:hidden text-white/40 text-xs font-medium italic">Entry</span>
-                    </div>
-
-                    {/* Mobile Status */}
-                    <div className="lg:hidden">
-                      {wallet.status === 'idle' && (
-                        <div className="text-[10px] font-bold text-white/20 uppercase tracking-widest px-2 py-0.5 bg-white/5 rounded-full border border-white/5">
-                          Ready
-                        </div>
-                      )}
-                      {wallet.status === 'pending' && (
-                        <div className="flex items-center gap-2 text-[10px] font-bold text-blue-400 uppercase tracking-widest px-2 py-0.5 bg-blue-500/10 rounded-full border border-blue-500/20">
-                          <Loader2 size={10} className="animate-spin" />
-                          Pending
-                        </div>
-                      )}
-                      {wallet.status === 'success' && (
-                        <div className="flex items-center gap-1 text-[10px] font-bold text-emerald-400 uppercase tracking-widest px-2 py-0.5 bg-emerald-500/10 rounded-full border border-emerald-500/20">
-                          <CheckCircle2 size={10} />
-                          OK
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:flex lg:flex-1 gap-4 lg:gap-4 items-end">
-                    {/* Public Address */}
-                    <div className="space-y-1.5 min-w-0 lg:flex-3">
-                      <label className="text-[10px] uppercase tracking-wider text-white/30 font-semibold ml-0.5">Address</label>
-                      <div className="flex items-center gap-2 bg-white/3 rounded-lg p-2.5 group/item">
-                        <code className="flex-1 font-mono text-[11px] sm:text-sm text-white/70 truncate">
-                          {wallet.address}
-                        </code>
-                        <Tooltip text={copiedIndex?.index === wallet.index && copiedIndex?.type === 'address' ? "Copied!" : "Copy Address"}>
-                          <button 
-                            onClick={() => copyToClipboard(wallet.address, wallet.index, 'address')}
-                            className="p-1.5 bg-white/5 hover:bg-white/15 rounded-md transition-colors text-white/40 hover:text-white shrink-0"
-                          >
-                            {copiedIndex?.index === wallet.index && copiedIndex?.type === 'address' ? (
-                              <CheckCircle2 size={14} className="text-emerald-400" />
-                            ) : (
-                              <Copy size={14} className="text-white/60" />
-                            )}
-                          </button>
-                        </Tooltip>
-                      </div>
-                    </div>
-
-                    {/* Amount */}
-                    <div className="space-y-1.5 lg:w-[100px] shrink-0">
-                      <label className="text-[10px] uppercase tracking-wider text-white/30 font-semibold ml-0.5">Amount</label>
-                      <div className="flex items-center gap-1 bg-white/3 rounded-lg p-2.5 border border-white/5 focus-within:border-emerald-500/30 transition-colors">
-                        <input 
-                          type="text"
-                          value={wallet.amount}
-                          onChange={(e) => updateWalletAmount(wallet.index, e.target.value)}
-                          className="w-full bg-transparent border-none focus:outline-none text-[12px] sm:text-sm font-mono text-emerald-400 text-center"
-                          placeholder="0.01"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Private Key */}
-                    <div className="space-y-1.5 min-w-0 lg:flex-2">
-                      <label className="text-[10px] uppercase tracking-wider text-white/30 font-semibold ml-0.5">Private Key</label>
-                      <div className="flex items-center gap-2 bg-white/3 rounded-lg p-2.5 group/item">
-                        <code className={cn(
-                          "flex-1 font-mono text-[11px] sm:text-sm transition-all duration-300 truncate",
-                          showPrivateKeys[wallet.index] ? "text-red-400/80" : "text-white/20 blur-sm select-none"
-                        )}>
-                          {wallet.privateKey}
-                        </code>
-                        <div className="flex items-center gap-1 shrink-0">
-                          <Tooltip text={showPrivateKeys[wallet.index] ? "Hide" : "Show"}>
-                            <button 
-                              onClick={() => togglePrivateKey(wallet.index)}
-                              className="p-1.5 bg-white/5 hover:bg-white/15 rounded-md transition-colors text-white/40 hover:text-white"
-                            >
-                              {showPrivateKeys[wallet.index] ? <EyeOff size={14} className="text-white/60" /> : <Eye size={14} className="text-white/60" />}
-                            </button>
-                          </Tooltip>
-                          <Tooltip text={copiedIndex?.index === wallet.index && copiedIndex?.type === 'pk' ? "Copied!" : "Copy PK"}>
-                            <button 
-                              onClick={() => copyToClipboard(wallet.privateKey, wallet.index, 'pk')}
-                              className="p-1.5 bg-white/5 hover:bg-white/15 rounded-md transition-colors text-white/40 hover:text-white"
-                            >
-                              {copiedIndex?.index === wallet.index && copiedIndex?.type === 'pk' ? (
-                                <CheckCircle2 size={14} className="text-emerald-400" />
-                              ) : (
-                                <Copy size={14} className="text-white/60" />
-                              )}
-                            </button>
-                          </Tooltip>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Desktop Status & Actions */}
-                  <div className="hidden lg:flex items-center gap-3 lg:min-w-[110px] justify-end pt-5">
-                    {wallet.status === 'idle' && (
-                      <div className="text-[10px] font-bold text-white/20 uppercase tracking-widest px-3 py-1 bg-white/5 rounded-full border border-white/5">
-                        Ready
-                      </div>
-                    )}
-                    {wallet.status === 'pending' && (
-                      <div className="flex items-center gap-2 text-[10px] font-bold text-blue-400 uppercase tracking-widest px-3 py-1 bg-blue-500/10 rounded-full border border-blue-500/20">
-                        <Loader2 size={12} className="animate-spin" />
-                        {wallet.txHash ? 'Transacting' : 'Preparing'}
-                      </div>
-                    )}
-                    {wallet.status === 'success' && (
-                      <div className="flex items-center gap-2 text-[10px] font-bold text-emerald-400 uppercase tracking-widest px-3 py-1 bg-emerald-500/10 rounded-full border border-emerald-500/20">
-                        <CheckCircle2 size={12} />
-                        Funded
-                      </div>
-                    )}
-                    {wallet.status === 'error' && (
-                      <div className="flex items-center gap-1">
-                        <Tooltip text={wallet.error || "Transaction failed"}>
-                          <div className="flex items-center gap-2 text-[10px] font-bold text-red-400 uppercase tracking-widest px-3 py-1 bg-red-500/10 rounded-full border border-red-500/20 cursor-help">
-                            <AlertCircle size={12} />
-                            Failed
-                          </div>
-                        </Tooltip>
-                        <Tooltip text="Retry Funding">
-                          <button 
-                            onClick={() => {
-                              const updated = [...wallets];
-                              const idx = updated.findIndex(w => w.index === wallet.index);
-                              if (idx !== -1) {
-                                updated[idx] = { ...updated[idx], status: 'idle', error: undefined };
-                                setWallets(updated);
-                                fundAllWallets(); 
-                              }
-                            }}
-                            className="p-1.5 bg-white/5 hover:bg-white/11 rounded-md transition-colors text-white/40 hover:text-white"
-                          >
-                            <Plus size={14} className="rotate-45" /> 
-                          </button>
-                        </Tooltip>
-                      </div>
-                    )}
-                    
-                    {wallet.txHash && (
-                      <Tooltip text="Explorer">
-                        <a 
-                          href={`https://etherscan.io/tx/${wallet.txHash}`} 
-                          target="_blank" 
-                          rel="noopener noreferrer"
-                          className="p-1.5 bg-white/5 hover:bg-white/15 rounded-md transition-colors text-white/40 hover:text-white"
-                        >
-                          <ExternalLink size={16} />
-                        </a>
-                      </Tooltip>
-                    )}
-                  </div>
-
-                  {/* Mobile Actions Overlay */}
-                  <div className="lg:hidden flex border-t border-white/5 pt-3 mt-1 items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      {wallet.txHash && (
-                        <a 
-                          href={`https://etherscan.io/tx/${wallet.txHash}`} 
-                          target="_blank" 
-                          rel="noopener noreferrer"
-                          className="flex items-center gap-1.5 text-[10px] text-blue-400 font-bold uppercase tracking-wider"
-                        >
-                          <ExternalLink size={12} />
-                          Explorer
-                        </a>
-                      )}
-                      {wallet.status === 'error' && (
-                        <button 
-                          onClick={() => {
-                            const updated = [...wallets];
-                            const idx = updated.findIndex(w => w.index === wallet.index);
-                            if (idx !== -1) {
-                              updated[idx] = { ...updated[idx], status: 'idle', error: undefined };
-                              setWallets(updated);
-                              fundAllWallets(); 
-                            }
-                          }}
-                          className="flex items-center gap-1.5 text-[10px] text-red-400 font-bold uppercase tracking-wider"
-                        >
-                          <Plus size={12} className="rotate-45" />
-                          Retry
-                        </button>
-                      )}
-                    </div>
-                    {wallet.error && (
-                      <span className="text-[10px] text-red-400/60 italic truncate max-w-[150px]">
-                        {wallet.error}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </motion.div>
-            ))}
-          </AnimatePresence>
-        </div>
-
-        {/* Pagination Controls */}
-        {totalPages > 1 && (
-          <motion.div 
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="flex items-center justify-center gap-2 pt-4"
-          >
-            <button
-              onClick={() => {
-                setCurrentPage(prev => Math.max(1, prev - 1));
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              disabled={currentPage === 1}
-              className="p-2 px-4 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-all text-sm font-medium"
-            >
-              Previous
-            </button>
-            
-            <div className="flex items-center gap-1 px-4">
-              <span className="text-white/40 text-sm">Page</span>
-              <span className="text-blue-400 font-mono font-bold">{currentPage}</span>
-              <span className="text-white/40 text-sm">of</span>
-              <span className="text-white/60 font-mono">{totalPages}</span>
-            </div>
-
-            <button
-              onClick={() => {
-                setCurrentPage(prev => Math.min(totalPages, prev + 1));
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              disabled={currentPage === totalPages}
-              className="p-2 px-4 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed transition-all text-sm font-medium"
-            >
-              Next
-            </button>
-          </motion.div>
-        )}
-
-        {/* History Section */}
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-5 sm:p-8"
-        >
-            <button
-              onClick={() => setShowHistory(!showHistory)}
-              className="w-full flex items-center justify-between mb-6"
-            >
-              <div className="flex items-center gap-3">
-                <History size={24} className="text-blue-400" />
-                <h2 className="text-2xl font-bold">Wallet History</h2>
-                <span className="px-3 py-1 bg-blue-500/20 text-blue-400 rounded-full text-sm font-semibold">
-                  {history.length} {history.length === 1 ? 'Session' : 'Sessions'}
-                </span>
-              </div>
-              {showHistory ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
-            </button>
-
-            <AnimatePresence>
-              {showHistory && history.length > 0 && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: 'auto' }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="space-y-4"
-                >
-                  {history.map((session) => {
-                    const stats = getSessionStats(session);
-                    const isExpanded = expandedSessions.has(session.id);
-                    const date = new Date(session.timestamp);
-
-                    return (
-                      <motion.div
-                        key={session.id}
-                        initial={{ opacity: 0, y: -10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="bg-white/3 border border-white/10 rounded-2xl p-4 sm:p-5"
-                      >
-                        {/* Session Header */}
-                        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-4">
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2 mb-2">
-                              <span className="text-sm font-semibold text-white/80">
-                                {formatRelativeTime(session.timestamp)}
-                              </span>
-                              <span className="text-[10px] text-white/30 font-medium">
-                                ({date.toLocaleDateString()} {date.toLocaleTimeString()})
-                              </span>
-                              {session.transferMode === 'bulk' && (
-                                <span className="px-2 py-0.5 bg-purple-500/20 text-purple-400 rounded text-xs font-semibold flex items-center gap-1">
-                                  <Zap size={12} />
-                                  Bulk
-                                </span>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-4 text-xs text-white/60">
-                              <span>{stats.total} wallets</span>
-                              <span className="text-emerald-400">{stats.successful} successful</span>
-                              {stats.failed > 0 && <span className="text-red-400">{stats.failed} failed</span>}
-                            </div>
-                          </div>
-
-                          {/* Actions */}
-                          <div className="flex items-center gap-2">
-                            <Tooltip text="Restore Session">
-                              <button
-                                onClick={() => restoreSession(session)}
-                                className="p-2 bg-blue-500/20 hover:bg-blue-500/30 rounded-lg transition-colors"
-                              >
-                                <RotateCcw size={16} className="text-blue-400" />
-                              </button>
-                            </Tooltip>
-                            <Tooltip text="Export CSV">
-                              <button
-                                onClick={() => exportSessionToCSV(session)}
-                                className="p-2 bg-emerald-500/20 hover:bg-emerald-500/30 rounded-lg transition-colors"
-                              >
-                                <Download size={16} className="text-emerald-400" />
-                              </button>
-                            </Tooltip>
-                            <Tooltip text="Export JSON">
-                              <button
-                                onClick={() => exportSessionToJSON(session)}
-                                className="p-2 bg-orange-500/20 hover:bg-orange-500/30 rounded-lg transition-colors"
-                              >
-                                <FileJson size={16} className="text-orange-400" />
-                              </button>
-                            </Tooltip>
-                            <Tooltip text="Delete Session">
-                              <button
-                                onClick={() => handleDeleteSession(session.id)}
-                                className="p-2 bg-red-500/20 hover:bg-red-500/30 rounded-lg transition-colors"
-                              >
-                                <Trash2 size={16} className="text-red-400" />
-                              </button>
-                            </Tooltip>
-                            <button
-                              onClick={() => toggleSessionExpand(session.id)}
-                              className="p-2 bg-white/5 hover:bg-white/10 rounded-lg transition-colors"
-                            >
-                              {isExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Bulk Transaction Hash */}
-                        {session.bulkTxHash && (
-                          <div className="mb-4 p-3 bg-purple-500/10 border border-purple-500/20 rounded-lg flex items-center justify-between">
-                            <div className="flex items-center gap-2">
-                              <Zap size={16} className="text-purple-400" />
-                              <span className="text-xs text-white/60 font-mono">
-                                {session.bulkTxHash.slice(0, 10)}...{session.bulkTxHash.slice(-8)}
-                              </span>
-                            </div>
-                            <a
-                              href={`https://etherscan.io/tx/${session.bulkTxHash}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-purple-400 hover:text-purple-300 transition-colors"
-                            >
-                              <ExternalLink size={14} />
-                            </a>
-                          </div>
-                        )}
-
-                        {/* Expanded Wallet List */}
-                        <AnimatePresence>
-                          {isExpanded && (
-                            <motion.div
-                              initial={{ opacity: 0, height: 0 }}
-                              animate={{ opacity: 1, height: 'auto' }}
-                              exit={{ opacity: 0, height: 0 }}
-                              className="space-y-2 pt-4 border-t border-white/10"
-                            >
-                              {session.wallets.slice(0, 10).map((wallet) => (
-                                <div
-                                  key={wallet.address}
-                                  className="flex items-center justify-between p-3 bg-white/3 rounded-lg text-xs"
-                                >
-                                  <div className="flex items-center gap-3 flex-1 min-w-0">
-                                    <span className="w-6 h-6 rounded bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-[10px] text-blue-400 shrink-0">
-                                      {wallet.index}
-                                    </span>
-                                    <code className="text-white/70 font-mono truncate">
-                                      {wallet.address}
-                                    </code>
-                                  </div>
-                                  <div className="flex items-center gap-2 shrink-0">
-                                    {wallet.status === 'success' && (
-                                      <CheckCircle2 size={14} className="text-emerald-400" />
-                                    )}
-                                    {wallet.status === 'error' && (
-                                      <AlertCircle size={14} className="text-red-400" />
-                                    )}
-                                    {wallet.txHash && (
-                                      <a
-                                        href={`https://etherscan.io/tx/${wallet.txHash}`}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="text-blue-400 hover:text-blue-300"
-                                      >
-                                        <ExternalLink size={12} />
-                                      </a>
-                                    )}
-                                  </div>
-                                </div>
-                              ))}
-                              {session.wallets.length > 10 && (
-                                <p className="text-center text-xs text-white/40 pt-2">
-                                  Showing 10 of {session.wallets.length} wallets. Export for full list.
-                                </p>
-                              )}
-                            </motion.div>
-                          )}
-                        </AnimatePresence>
-                      </motion.div>
-                    );
-                  })}
-                </motion.div>
-              )}
-              {showHistory && history.length === 0 && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="text-center py-12 text-white/40"
-                >
-                  <History size={48} className="mx-auto mb-4 opacity-30" />
-                  <p className="text-sm">No wallet sessions yet. Generate wallets to start building your history.</p>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </motion.div>
-
-        {wallets.length === 0 && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="flex flex-col items-center justify-center py-20 text-white/20 space-y-4"
-          >
-            <WalletIcon size={48} strokeWidth={1} />
-            <p className="text-sm font-medium">Generate some wallets to get started</p>
-          </motion.div>
-        )}
-
-        <footer className="text-center pt-8 text-white/20 text-xs">
-          <p>© 2026 Ethos • Orchestrated by Kellie-Brighty</p>
+        <footer className="text-center pb-8 text-white/10 text-[10px] font-bold uppercase tracking-[0.2em]">
+          <p>© 2026 Ethos Protocol • Secured by Decentralization</p>
         </footer>
       </main>
     </div>
